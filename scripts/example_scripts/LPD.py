@@ -30,9 +30,9 @@ def my_ssim(x, y):
 device = torch.device("cuda:1")
 torch.cuda.set_device(device)
 # Define your data paths
-savefolder = pathlib.Path("/store/DAMTP/ab2860/trained_models/test_debbuging/")
+savefolder = pathlib.Path("/store/DAMTP/mh2328/trained_models/test_debbuging/")
 final_result_fname = savefolder.joinpath("LPD.pt")
-checkpoint_fname = "LPD_check_*.pt"
+checkpoint_fname = savefolder.joinpath("LPD_check_*.pt")
 validation_fname = savefolder.joinpath("LPD_min_val.pt")
 #
 #%% Define experiment
@@ -104,7 +104,7 @@ solver.set_validation(lidc_validation, 10, validation_fname=validation_fname)
 solver.set_testing(lidc_test, my_ssim)
 
 # set checkpointing procedure
-solver.set_checkpointing(savefolder, checkpoint_fname, 10, load_checkpoint=False)
+solver.set_checkpointing(savefolder, checkpoint_fname, 10, do_load=False)
 # train
 solver.train(train_param.epochs)
 # delete checkpoints if finished
