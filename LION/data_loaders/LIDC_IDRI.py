@@ -27,6 +27,10 @@ from LION.utils.paths import LIDC_IDRI_PROCESSED_DATASET_PATH
 import LION.CTtools.ct_utils as ct
 from LION.utils.parameter import LIONParameter
 
+import logging
+
+logging.basicConfig(filename="logs/volume_debug.log", level=logging.DEBUG, format="%(asctime)s - %(message)s")
+
 
 def format_index(index: int) -> str:
     str_index = str(index)
@@ -365,6 +369,9 @@ class LIDC_IDRI(Dataset):
         param.volume_representation = False
         param.voxel_spacing = (1.0, 1.0, 1.0)  # Default target voxel spacing
         param.sampling_thickness = {}  # Default to empty; can be set later
+        # Set tumor size filtering parameters
+        param.min_tumor_size = None
+        param.max_tumor_size = None
 
         return param
 
@@ -501,6 +508,46 @@ class LIDC_IDRI(Dataset):
             raise AttributeError("CT operator not know. Have you given a ct geometry?")
         sinogram = self.operator(image)
         return sinogram
+
+    def filter_tumors_by_size(self, mask_volume: np.ndarray, min_size: float = None, max_size: float = None) -> np.ndarray:
+        """
+        Filters tumors in a 3D mask by removing tumors whose longest axis is outside the specified range.
+
+        Parameters:
+            mask_volume (np.ndarray): 3D binary mask of the tumors (depth, height, width).
+            min_size (float): Minimum tumor size to keep (in mm). Default is None.
+            max_size (float): Maximum tumor size to keep (in mm). Default is None.
+
+        Returns:
+            np.ndarray: Filtered 3D mask with tumors within the specified size range.
+        """
+        labeled_mask, num_features = label(mask_volume)  # Label connected components (tumors)
+        
+        # If no tumors are found, return the original mask
+        if num_features == 0:
+            return mask_volume
+
+        # Initialize an empty mask to store filtered tumors
+        filtered_mask = np.zeros_like(mask_volume)
+
+        # Loop over each labeled tumor
+        for tumor_label in range(1, num_features + 1):
+            tumor = (labeled_mask == tumor_label)  # Extract the current tumor as a binary mask
+            
+            # Calculate the bounding box of the tumor
+            coords = np.argwhere(tumor)
+            min_coords = np.min(coords, axis=0)
+            max_coords = np.max(coords, axis=0)
+            
+            # Compute the longest axis of the tumor
+            longest_axis = np.linalg.norm(max_coords - min_coords)
+            
+            # Check if the tumor is within the specified size range
+            if ((min_size is None or longest_axis >= min_size) and
+                (max_size is None or longest_axis <= max_size)):
+                filtered_mask = np.logical_or(filtered_mask, tumor)  # Keep the tumor
+        
+        return filtered_mask
 
     def get_mask_tensor(self, patient_id: str, slice_index: int) -> torch.Tensor:
         """
@@ -649,38 +696,47 @@ class LIDC_IDRI(Dataset):
     def get_patient_volume(self, patient_id: str):
         """
         Fetches the full volume and corresponding masks for a given patient.
-
-        Parameters:
-            - patient_id (str): The ID of the patient.
-
-        Returns:
-            - volume_tensor (torch.Tensor): The 3D volume (1, depth, 512, 512).
-            - mask_tensor (torch.Tensor): The 3D mask (2, depth, 512, 512).
+        If the slice thickness is missing, it uses the slice thickness of a neighboring patient.
         """
-        # print(f"Fetching volume for patient {patient_id}")
-
-        # Get slice indices and thickness for interpolation
+        # Get slice indices and initial slice thickness
         slice_indices = self.slices_to_load.get(patient_id, [])
         slice_thickness = self.sampling_thickness.get(patient_id)
 
+        # Handle missing slice thickness
+        if slice_thickness is None:
+            # Attempt to find the thickness of neighboring patients
+            patient_index = self.patient_ids.index(patient_id)
+            found_thickness = False
+            for offset in range(1, len(self.patient_ids)):
+                # Look backward
+                if patient_index - offset >= 0:
+                    neighbor_id = self.patient_ids[patient_index - offset]
+                    slice_thickness = self.sampling_thickness.get(neighbor_id)
+                    if slice_thickness is not None:
+                        found_thickness = True
+                        break
 
-        # print(f"Found {len(slice_indices)} slices for patient {patient_id}")
+                # Look forward
+                if patient_index + offset < len(self.patient_ids):
+                    neighbor_id = self.patient_ids[patient_index + offset]
+                    slice_thickness = self.sampling_thickness.get(neighbor_id)
+                    if slice_thickness is not None:
+                        found_thickness = True
+                        break
 
-        # Open a file to log all the patients for which no slices or slice thickness is not found
-        log_file_path = "patients_missing_slices_or_thickness.txt"
+            if not found_thickness:
+                # Log and return empty tensors if no neighbor has a valid thickness
+                with open("patients_missing_slices_or_thickness.txt", "a") as log_file:
+                    log_file.write(f"Slice thickness not found for patient {patient_id} and its neighbors.\n")
+                return (
+                    torch.zeros((1, 1, 512, 512), dtype=torch.float32),
+                    torch.zeros((2, 1, 512, 512), dtype=torch.float32),
+                )
 
-        # Open the file in append mode to ensure we don't overwrite previous logs
-        with open(log_file_path, "a") as log_file:
-
-            if not slice_indices:
-                log_file.write(f"No slice indices found for patient {patient_id}.\n")
-                # print(f"No slice indices found for patient {patient_id}.")
-                return torch.zeros((1, 1, 512, 512), dtype=torch.float32), torch.zeros((2, 1, 512, 512), dtype=torch.float32)
-
-            if slice_thickness is None:
-                log_file.write(f"Slice thickness not found for patient {patient_id}.\n")
-                # print(f"Slice thickness not found for patient {patient_id}.")
-                return torch.zeros((1, 1, 512, 512), dtype=torch.float32), torch.zeros((2, 1, 512, 512), dtype=torch.float32)
+        # Log the usage of neighboring slice thickness
+        if patient_id not in self.sampling_thickness or self.sampling_thickness[patient_id] is None:
+            with open("patients_missing_slices_or_thickness.txt", "a") as log_file:
+                log_file.write(f"Patient {patient_id} uses slice thickness from neighbor.\n")
 
         slices = []
         masks = []
@@ -692,17 +748,17 @@ class LIDC_IDRI(Dataset):
             )
 
             if not file_path.exists():
-                print(f"File not found: {file_path}")
+                logging.debug(f"File not found: {file_path}")
                 continue
 
             slice_image = self.get_reconstruction_tensor(file_path)
             if slice_image is None or slice_image.numel() == 0:
-                print(f"Invalid slice image for file: {file_path}")
+                logging.debug(f"Invalid slice image for file: {file_path}")
                 continue
 
             mask = self.get_mask_tensor(patient_id, slice_index)
             if mask is None or mask.numel() == 0:
-                print(f"Invalid mask for slice {slice_index} of patient {patient_id}")
+                logging.debug(f"Invalid mask for slice {slice_index} of patient {patient_id}")
                 continue
 
             # Apply image transformation if defined
@@ -717,12 +773,27 @@ class LIDC_IDRI(Dataset):
 
         # Check if slices were loaded
         if not slices:
-            print(f"No valid slices found for patient {patient_id}. Returning empty tensors.")
+            logging.debug(f"No valid slices found for patient {patient_id}. Returning empty tensors.")
             return torch.zeros((1, 1, 512, 512), dtype=torch.float32), torch.zeros((2, 1, 512, 512), dtype=torch.float32)
 
+        logging.debug(f"Loaded volume for patient {patient_id}. Shape: {len(slices)} slices")
         # Stack slices to form 3D volume
         volume = np.stack(slices, axis=0)  # Shape: (depth, 512, 512)
         mask_volume = np.stack(masks, axis=0)  # Shape: (depth, 2, 512, 512)
+        logging.debug(f"Loaded volume for patient {patient_id}. Shape: {volume.shape}")
+        mask_volume = np.stack(masks, axis=0)  # Shape: (depth, 2, 512, 512)
+        tumor_mask = mask_volume[:, 1, :, :]  # Extract the tumor channel
+        
+        logging.debug(f"Min tumor size: {self.params.min_tumor_size}, Max tumor size: {self.params.max_tumor_size}")
+        # Apply tumor size filtering
+        filtered_tumor_mask = self.filter_tumors_by_size(
+            tumor_mask,
+            min_size=self.params.min_tumor_size,
+            max_size=self.params.max_tumor_size
+        )
+        
+        # Update the mask volume with the filtered tumors
+        mask_volume[:, 1, :, :] = filtered_tumor_mask
 
         # Interpolate to finer z-spacing
         original_spacing = (slice_thickness, 1.0, 1.0)  # Original (z, y, x) spacing
@@ -741,6 +812,7 @@ class LIDC_IDRI(Dataset):
             mask_channels.append(mask_channel)
 
         mask_volume = np.stack(mask_channels, axis=0)  # Shape: (2, depth, 512, 512)
+        logging.debug(f"Interpolated mask volume for patient {patient_id}. Shape: {mask_volume.shape}")
 
         # Normalize the volume if lung_only is active
         if self.params.task == "segmentation" and self.params.lung_only:
@@ -750,8 +822,10 @@ class LIDC_IDRI(Dataset):
         volume_tensor = torch.from_numpy(volume).unsqueeze(0)  # Shape: (1, depth, 512, 512)
         mask_tensor = torch.from_numpy(mask_volume)  # Shape: (2, depth, 512, 512)
 
-        # print(f"Resampled volume shape: {volume_tensor.shape}, Mask shape: {mask_tensor.shape}")
+        logging.debug(f"Volume tensor shape: {volume_tensor.shape}, Mask tensor shape: {mask_tensor.shape}")
+
         return volume_tensor, mask_tensor
+
 
 
         
@@ -820,7 +894,7 @@ class LIDC_IDRI(Dataset):
 
 
 class VolumeWindowDataloader(Dataset):
-    def __init__(self, dataset, window_depth, pad_value=0, stride=1, nodule_only=False):
+    def __init__(self, dataset, window_depth, pad_value=0, stride=1, nodule_only=True):
         """
         A dynamic dataloader for processing volumes as they are accessed.
 
