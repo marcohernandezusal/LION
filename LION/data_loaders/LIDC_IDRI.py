@@ -22,6 +22,8 @@ import matplotlib.pyplot as plt
 from skimage.filters import threshold_otsu
 from skimage.morphology import remove_small_objects
 from scipy.ndimage import label, binary_fill_holes, binary_dilation, binary_erosion, zoom
+from scipy.signal import welch
+from scipy.fft import fft, ifft
 
 from LION.utils.paths import LIDC_IDRI_PROCESSED_DATASET_PATH
 import LION.CTtools.ct_utils as ct
@@ -149,6 +151,8 @@ class LIDC_IDRI(Dataset):
             self.operator = ct.make_operator(geometry_parameters)
         elif self.params.geo is not None:
             self.operator = ct.make_operator(self.params.geo)
+
+
         # Start of Patient pre-processing
 
         self.path_to_processed_dataset = pathlib.Path(self.params.folder)
@@ -300,6 +304,13 @@ class LIDC_IDRI(Dataset):
             f"Len patients ids: {len(self.patient_ids)}, \n len training patients {len(self.training_patients_list)},\n len validation patients {len(self.validation_patients_list)}, \n len testing patients {len(self.testing_patients_list)}"
         )
 
+        logging.info(f"Total patients: {self.total_patients}")
+        logging.info(f"Training patients: {self.n_patients_training}")
+        logging.info(f"Validation patients: {self.n_patients_validation}")
+        logging.info(f"Testing patients: {self.n_patients_testing}")
+
+            
+
         print("Preparing patient list, this may take time....")
         if self.params.mode == "train":
             patient_list_to_load = self.training_patients_list
@@ -314,7 +325,37 @@ class LIDC_IDRI(Dataset):
         # print(f"Dataset initialized with mode: {self.params.mode}")
         # print(f"Patients to load for mode {self.params.mode}: {patient_list_to_load}")
 
+        # Load tumor metadata if min_tumor_size or max_tumor_size is specified
+        if self.params.min_tumor_size is not None or self.params.max_tumor_size is not None:
+            metadata_path = f"tumor_metadata_files/{mode}_tumor_metadata.json"
+            with open(metadata_path, "r") as f:
+                tumor_metadata = json.load(f)
 
+            # Define filtering criteria
+            min_tumor_size = self.params.min_tumor_size or 0
+            max_tumor_size = self.params.max_tumor_size or float("inf")
+
+            # Filter patients based on tumor size
+            def filter_patients(patient_list):
+                return [
+                    patient_id
+                    for patient_id in patient_list
+                    if min_tumor_size
+                    <= tumor_metadata.get(patient_id, {}).get("max_tumor_axis_length", 0)
+                    <= max_tumor_size
+                ]
+
+            if mode == "train":
+                self.training_patients_list = filter_patients(self.training_patients_list)
+                logging.info(f"Filtered {mode} patient list: {len(self.training_patients_list)} patients remaining")
+            elif mode == "validation":
+                self.validation_patients_list = filter_patients(self.validation_patients_list)
+                logging.info(f"Filtered {mode} patient list: {len(self.validation_patients_list)} patients remaining")
+            elif mode == "test":
+                self.testing_patients_list = filter_patients(self.testing_patients_list)
+                logging.info(f"Filtered {mode} patient list: {len(self.testing_patients_list)} patients remaining")
+
+        
         self.slices_to_load = self.get_slices_to_load(
             patient_list_to_load,
             self.patient_index_to_non_nodule_slices_index_dict,
@@ -337,6 +378,62 @@ class LIDC_IDRI(Dataset):
         if self.params.volume_representation:
             self.voxel_spacing = self.params.voxel_spacing
             self.sampling_thickness = self.params.sampling_thickness or {}
+            self.interpolation_method = self.params.interpolation_method
+            self.bspline_order = self.params.bspline_order
+            self.sinc_width = self.params.welch_sinc_width
+
+        self.patient_list_to_load = patient_list_to_load
+
+        # ============== FINAL CHECK to remove zero-tumor patients =============
+        self._final_check_and_filter_patients(mode)
+        # =======================================================================
+
+
+    def _final_check_and_filter_patients(self, mode: str):
+        """
+        Final pass: For each patient in the relevant list, load the slices in minimal form
+        and check if the tumor mask is completely empty after real filtering logic.
+        If it is empty, log that the patient does not match the metadata but do NOT remove them.
+        """
+        if mode == "train":
+            patient_list = self.training_patients_list
+        elif mode == "validation":
+            patient_list = self.validation_patients_list
+        elif mode == "test":
+            patient_list = self.testing_patients_list
+        else:
+            return  # no-op for safety
+
+        for pid in patient_list:
+            volume_and_mask = self.get_patient_volume(pid)
+
+            # If get_patient_volume returned None or the mask is entirely zeros, log mismatch
+            if volume_and_mask is None:
+                logging.warning(
+                    f"Patient {pid} in mode={mode} yields no valid volume/mask "
+                    f"(metadata said there should be a tumor)."
+                )
+                continue
+
+            # Check for tumor_patch_mode
+            if isinstance(volume_and_mask, list):
+                # It's a list of patches
+                if len(volume_and_mask) == 0:
+                    logging.warning(
+                        f"Patient {pid} in mode={mode} yields 0 patches "
+                        f"(metadata said there should be a tumor)."
+                    )
+            else:
+                # It's (volume_tensor, mask_tensor)
+                volume_tensor, mask_tensor = volume_and_mask
+                # Check if there are any nonzero tumor voxels
+                if mask_tensor[1].sum() == 0:
+                    logging.warning(
+                        f"Patient {pid} in mode={mode} yields an empty tumor mask "
+                        f"(metadata said there should be a tumor)."
+                    )
+
+        logging.info(f"Final check complete for mode={mode}. Potential mismatches have been logged.")
 
     @staticmethod
     def default_parameters(geo=None, task="reconstruction"):
@@ -369,9 +466,15 @@ class LIDC_IDRI(Dataset):
         param.volume_representation = False
         param.voxel_spacing = (1.0, 1.0, 1.0)  # Default target voxel spacing
         param.sampling_thickness = {}  # Default to empty; can be set later
+        param.interpolation_method = 'bspline' # Default interpolation method
+        param.bspline_order = 3 # Default B-spline interpolation order
+        param.welch_sinc_width = 5 # Default Welch window sinc width
         # Set tumor size filtering parameters
         param.min_tumor_size = None
         param.max_tumor_size = None
+        # Set patch parameters
+        param.tumor_patch_mode = False  # Default: return full images
+        param.patch_size = (80, 80)  # Patch size (width, height)
 
         return param
 
@@ -541,6 +644,7 @@ class LIDC_IDRI(Dataset):
             
             # Compute the longest axis of the tumor
             longest_axis = np.linalg.norm(max_coords - min_coords)
+            logging.debug(f"Tumor {tumor_label} has longest axis of {longest_axis:.2f} mm")
             
             # Check if the tumor is within the specified size range
             if ((min_size is None or longest_axis >= min_size) and
@@ -593,7 +697,7 @@ class LIDC_IDRI(Dataset):
 
     def __len__(self):
         if self.params.volume_representation:
-            return len(self.patient_ids)  # Number of patients
+            return len(self.patient_list_to_load)  # Number of patients
         else:
             return len(self.slice_index_to_patient_id_list)  # Number of slices
 
@@ -606,15 +710,17 @@ class LIDC_IDRI(Dataset):
             patient_index, slice_index
         )
 
-    def interpolate_volume(self, volume, original_spacing, target_spacing, order=1):
+    def interpolate_volume(self, volume, original_spacing, target_spacing, method = 'bspline', order = 3, sinc_width = 5):
         """
-        Resample a 3D volume to the target spacing.
+        Resample a 3D volume to the target spacing using the specified interpolation method.
 
         Parameters:
             - volume (np.ndarray): Input 3D volume (z, y, x).
             - original_spacing (tuple): Original voxel spacing (z, y, x).
             - target_spacing (tuple): Desired voxel spacing (z, y, x).
-            - order (int): Interpolation order. Default is 1 (linear). Use 0 for nearest-neighbor (binary masks).
+            - method (str): Interpolation method. Options: 'bspline', 'welch_sinc'.
+            - order (int): B-Spline order. Relevant if method='bspline'. Default is 3 (cubic).
+            - sinc_width (int): Number of sinc lobes on each side. Relevant if method='welch_sinc'. Default is 5.
 
         Returns:
             - Resampled 3D volume (np.ndarray).
@@ -625,10 +731,98 @@ class LIDC_IDRI(Dataset):
         assert len(target_spacing) == volume.ndim, (
             f"Target spacing {target_spacing} must match volume dimensions {volume.ndim}."
         )
-        
-        resize_factors = [original / target for original, target in zip(original_spacing, target_spacing)]
+        assert method in ['bspline', 'welch_sinc'], (
+            f"Unsupported interpolation method '{method}'. Choose 'bspline' or 'welch_sinc'."
+        )
 
-        return zoom(volume, resize_factors, order=order)
+        resize_factors = [original / target for original, target in zip(original_spacing, target_spacing)]
+        logging.debug(f"Interpolation method: {method}")
+        logging.debug(f"Original spacing: {original_spacing}, Target spacing: {target_spacing}")
+        logging.debug(f"Resize factors: {resize_factors}")
+
+        if method == 'bspline':
+            logging.debug(f"Performing B-Spline interpolation with order={order}")
+            resampled = zoom(volume, resize_factors, order=order)
+            logging.debug(f"Resampled volume shape (B-Spline): {resampled.shape}")
+            return resampled
+
+        elif method == 'welch_sinc':
+            logging.debug(f"Performing Welch windowed sinc interpolation with sinc_width={sinc_width}")
+            resampled = self.welch_windowed_sinc_interpolate(volume, resize_factors, sinc_width)
+            logging.debug(f"Resampled volume shape (Welch Sinc): {resampled.shape}")
+            return resampled
+
+    def welch_windowed_sinc_interpolate(
+        self,
+        volume: np.ndarray,
+        resize_factors: list,
+        sinc_width: int = 5
+    ) -> np.ndarray:
+        """
+        Apply Welch windowed sinc interpolation to a 3D volume.
+
+        Parameters:
+            - volume (np.ndarray): 3D volume.
+            - resize_factors (list): Resize factors for each axis.
+            - sinc_width (int): Number of sinc lobes on each side.
+
+        Returns:
+            - Resampled 3D volume (np.ndarray).
+        """
+        logging.debug("Starting Welch windowed sinc interpolation.")
+
+        def resample_axis(data, axis, factor, sinc_width):
+            """
+            Resample data along a single axis using windowed sinc interpolation.
+
+            Parameters:
+                - data (np.ndarray): Input data.
+                - axis (int): Axis to resample.
+                - factor (float): Resize factor.
+                - sinc_width (int): Number of sinc lobes on each side.
+
+            Returns:
+                - Resampled data.
+            """
+            logging.debug(f"Resampling axis {axis} with factor {factor} and sinc_width {sinc_width}.")
+
+            original_size = data.shape[axis]
+            target_size = int(np.round(original_size * factor))
+            logging.debug(f"Original size: {original_size}, Target size: {target_size}")
+
+            # Create the output indices
+            target_indices = np.linspace(0, original_size, target_size, endpoint=False)
+
+            # Define the sinc kernel
+            # Calculate the distance between original and target samples
+            x = (target_indices - np.arange(original_size)[:, np.newaxis])
+            x = x / factor  # Scale by resize factor
+            x = x[np.abs(x) <= sinc_width]  # Limit to sinc_width
+
+            # Apply sinc function
+            sinc_kernel = np.sinc(x)
+
+            # Apply Welch (Hanning) window
+            window = get_window('hanning', sinc_kernel.shape[1])
+            windowed_sinc = sinc_kernel * window
+            windowed_sinc /= np.sum(windowed_sinc, axis=1, keepdims=True)  # Normalize
+
+            # Perform convolution using the windowed sinc kernel
+            resampled = convolve1d(data, windowed_sinc, axis=axis, mode='mirror')
+
+            logging.debug(f"Completed resampling axis {axis}.")
+            return resampled
+
+        resampled_volume = volume.copy()
+        for axis, factor in enumerate(resize_factors):
+            if factor == 1.0:
+                logging.debug(f"No resampling needed for axis {axis}. Skipping.")
+                continue  # Skip axes with no resampling needed
+            resampled_volume = resample_axis(resampled_volume, axis, factor, sinc_width)
+
+        logging.debug("Completed Welch windowed sinc interpolation.")
+        return resampled_volume
+
 
     def normalize_lungs(self, volume, method="none"):
         """
@@ -651,6 +845,78 @@ class LIDC_IDRI(Dataset):
             return (volume - mean) / (std + 1e-8)
         else:
             raise ValueError(f"Unsupported normalization method: {method}")
+
+    def extract_tumor_centered_patches(self, volume, mask, patch_size=(80, 80)):
+        """
+        Extracts patches centered on each tumor centroid.
+
+        Parameters:
+            volume (np.ndarray): 3D volume array of shape (depth, height, width).
+            mask (np.ndarray): 3D binary mask of the tumors (depth, height, width).
+            patch_size (tuple): Size of the patch (width, height).
+
+        Returns:
+            list of tuples: Each tuple contains a patch and the corresponding mask patch.
+        """
+        depth, height, width = volume.shape
+        mask = mask[1,:,:,:]
+        patch_half_size = (patch_size[0] // 2, patch_size[1] // 2)
+        labeled_mask, num_features = label(mask)
+        logging.debug(f"Volume and mask shapes: {volume.shape}, {mask.shape} in extract_tumor_centered_patches")
+        
+        patches = []
+        for tumor_label in range(1, num_features + 1):
+            coords = np.argwhere(labeled_mask == tumor_label)
+            centroid = np.mean(coords, axis=0).astype(int)
+            z, y, x = centroid
+
+            # Compute patch boundaries
+            y_start, y_end = max(0, y - patch_half_size[0]), min(height, y + patch_half_size[0])
+            x_start, x_end = max(0, x - patch_half_size[1]), min(width, x + patch_half_size[1])
+            
+            # Calculate actual start and end indices within image bounds
+            y_start_clipped, y_end_clipped = max(0, y - patch_half_size[0]), min(height, y + patch_half_size[0])
+            x_start_clipped, x_end_clipped = max(0, x - patch_half_size[1]), min(width, x + patch_half_size[1])
+
+            volume_patch_list = []
+            mask_patch_list = []
+            # Iterate through the slices (z) where the tumor exists in the mask
+            for slice in range(coords[0][0], coords[-1][0] + 1):
+            # Extract patch within valid bounds
+                logging.debug(f"Extracting patch centered at ({z}, {y}, {x})")
+                logging.debug(f"Volume shape: {volume.shape}, Mask shape: {mask.shape}")
+                patch_volume = volume[slice, y_start_clipped:y_end_clipped, x_start_clipped:x_end_clipped]
+                patch_mask = mask[slice, y_start_clipped:y_end_clipped, x_start_clipped:x_end_clipped]
+
+                # Calculate padding required for each side
+                top_padding = max(0, patch_half_size[0] - y_start)
+                bottom_padding = max(0, y_end - (height - patch_half_size[0]))
+                left_padding = max(0, patch_half_size[1] - x_start)
+                right_padding = max(0, x_end - (width - patch_half_size[1]))
+
+                # Apply padding to patches
+                patch_volume = np.pad(patch_volume, ((top_padding, bottom_padding), (left_padding, right_padding)),
+                                    mode='constant', constant_values=0)
+                patch_mask = np.pad(patch_mask, ((top_padding, bottom_padding), (left_padding, right_padding)),
+                                    mode='constant', constant_values=0)
+                
+                # Append the patch and mask to the list
+                volume_patch_list.append(patch_volume)
+                mask_patch_list.append(patch_mask)
+
+            # Convert lists to numpy arrays with [z, y, x] dimensions
+            patch_volume = np.stack(volume_patch_list)
+            patch_mask = np.stack(mask_patch_list)
+
+            logging.debug(f"Patch shape: {patch_volume.shape}, Mask shape: {patch_mask.shape}")
+            logging.debug(f"Patch height: {len(patch_volume)}, Patch width: {len(patch_volume[0])}")
+
+            logging.debug(f"Patch dimensions: z={patch_volume.shape[0]}, y={patch_volume.shape[1]}, x={patch_volume.shape[2]}")
+
+
+            patches.append((patch_volume, patch_mask))
+        
+        return patches
 
     def __getitem__(self, index):
         """
@@ -705,20 +971,20 @@ class LIDC_IDRI(Dataset):
         # Handle missing slice thickness
         if slice_thickness is None:
             # Attempt to find the thickness of neighboring patients
-            patient_index = self.patient_ids.index(patient_id)
+            patient_index = self.patient_list_to_load.index(patient_id)
             found_thickness = False
-            for offset in range(1, len(self.patient_ids)):
+            for offset in range(1, len(self.patient_list_to_load)):
                 # Look backward
                 if patient_index - offset >= 0:
-                    neighbor_id = self.patient_ids[patient_index - offset]
+                    neighbor_id = self.patient_list_to_load[patient_index - offset]
                     slice_thickness = self.sampling_thickness.get(neighbor_id)
                     if slice_thickness is not None:
                         found_thickness = True
                         break
 
                 # Look forward
-                if patient_index + offset < len(self.patient_ids):
-                    neighbor_id = self.patient_ids[patient_index + offset]
+                if patient_index + offset < len(self.patient_list_to_load):
+                    neighbor_id = self.patient_list_to_load[patient_index + offset]
                     slice_thickness = self.sampling_thickness.get(neighbor_id)
                     if slice_thickness is not None:
                         found_thickness = True
@@ -771,18 +1037,19 @@ class LIDC_IDRI(Dataset):
             slices.append(slice_image.squeeze(0).cpu().numpy())  # Convert to numpy
             masks.append(mask.cpu().numpy())
 
+        logging.debug(f"Loaded volume for patient {patient_id}. Shape: {len(slices)} slices, {len(masks)} masks. Slice thickness: {slice_thickness}")
         # Check if slices were loaded
         if not slices:
             logging.debug(f"No valid slices found for patient {patient_id}. Returning empty tensors.")
             return torch.zeros((1, 1, 512, 512), dtype=torch.float32), torch.zeros((2, 1, 512, 512), dtype=torch.float32)
 
-        logging.debug(f"Loaded volume for patient {patient_id}. Shape: {len(slices)} slices")
         # Stack slices to form 3D volume
         volume = np.stack(slices, axis=0)  # Shape: (depth, 512, 512)
         mask_volume = np.stack(masks, axis=0)  # Shape: (depth, 2, 512, 512)
-        logging.debug(f"Loaded volume for patient {patient_id}. Shape: {volume.shape}")
+        logging.debug(f"Loaded volume for patient {patient_id}. Shape: {volume.shape} slices, {mask_volume.shape} masks.")
         mask_volume = np.stack(masks, axis=0)  # Shape: (depth, 2, 512, 512)
         tumor_mask = mask_volume[:, 1, :, :]  # Extract the tumor channel
+        logging.debug(f"Mask volume shape: {mask_volume.shape}, Tumor mask shape: {tumor_mask.shape}")
         
         logging.debug(f"Min tumor size: {self.params.min_tumor_size}, Max tumor size: {self.params.max_tumor_size}")
         # Apply tumor size filtering
@@ -791,14 +1058,26 @@ class LIDC_IDRI(Dataset):
             min_size=self.params.min_tumor_size,
             max_size=self.params.max_tumor_size
         )
+
+        logging.debug(f"Filtered tumor mask has {filtered_tumor_mask.sum()} non-zero elements.")
+
         
         # Update the mask volume with the filtered tumors
         mask_volume[:, 1, :, :] = filtered_tumor_mask
 
+        logging.debug(f"Volume and mask shapes after tumor filtering: {volume.shape}, {mask_volume.shape}")
+
         # Interpolate to finer z-spacing
         original_spacing = (slice_thickness, 1.0, 1.0)  # Original (z, y, x) spacing
         target_spacing = self.voxel_spacing
-        volume = self.interpolate_volume(volume, original_spacing, target_spacing, order=1)
+        volume = self.interpolate_volume(
+                volume=volume,
+                original_spacing=original_spacing,
+                target_spacing=target_spacing,
+                method=self.params.interpolation_method,
+                order=self.params.bspline_order,           # Relevant for B-Spline
+                sinc_width=self.params.welch_sinc_width    # Relevant for Welch Sinc
+            )
 
         # Interpolate each mask channel separately with nearest-neighbor interpolation
         mask_channels = []
@@ -807,26 +1086,46 @@ class LIDC_IDRI(Dataset):
                 mask_volume[:, channel, :, :],
                 original_spacing,
                 target_spacing,
-                order=0  # Nearest-neighbor interpolation
+                order=1  # Nearest-neighbor interpolation
             )
             mask_channels.append(mask_channel)
 
         mask_volume = np.stack(mask_channels, axis=0)  # Shape: (2, depth, 512, 512)
+        logging.debug(f"Volume and mask shapes after interpolation: {volume.shape}, {mask_volume.shape}")
         logging.debug(f"Interpolated mask volume for patient {patient_id}. Shape: {mask_volume.shape}")
 
         # Normalize the volume if lung_only is active
         if self.params.task == "segmentation" and self.params.lung_only:
             volume = self.normalize_lungs(volume, method=self.params.normalize_lungs)
 
-        # Convert to PyTorch tensors
-        volume_tensor = torch.from_numpy(volume).unsqueeze(0)  # Shape: (1, depth, 512, 512)
-        mask_tensor = torch.from_numpy(mask_volume)  # Shape: (2, depth, 512, 512)
+        logging.debug(f"Volume and Mask shapes before calling tumor patch extraction: {volume.shape}, {mask_volume.shape}")
+    
+        if self.params.tumor_patch_mode:
 
-        logging.debug(f"Volume tensor shape: {volume_tensor.shape}, Mask tensor shape: {mask_tensor.shape}")
+            logging.debug(f"Tumor patch mode enabled. Extracting tumor-centered patches.")
+            
+            # Extract tumor-centered patches after filtering
+            tumor_volumes = self.extract_tumor_centered_patches(volume, mask_volume, self.params.patch_size)
 
-        return volume_tensor, mask_tensor
+            # Return one volume per tumor
+            patches = [(
+                torch.from_numpy(patch_volume).unsqueeze(0),  # Shape: (1, patch_depth, patch_height, patch_width)
+                torch.from_numpy(patch_mask)     # Shape: (1, patch_depth, patch_height, patch_width)
+            ) for patch_volume, patch_mask in tumor_volumes]
+            logging.debug(f"Number of patches: {len(patches)}")
+            if len(patches) > 0:
+                logging.debug(f"Volume patch tensor shape: {patches[0][0].shape}, Mask patch tensor shape: {patches[0][1].shape}")
+            return patches
 
+        else:
+            logging.debug(f"Returning full volume for patient {patient_id}. Shape: {volume.shape}")
+            # Convert to PyTorch tensors
+            volume_tensor = torch.from_numpy(volume).unsqueeze(0)  # Shape: (1, depth, 512, 512)
+            mask_tensor = torch.from_numpy(mask_volume)  # Shape: (2, depth, 512, 512)
 
+            logging.debug(f"Volume tensor shape: {volume_tensor.shape}, Mask tensor shape: {mask_tensor.shape}")
+
+            return volume_tensor, mask_tensor
 
         
     def preprocess_pipeline_setup(self):
@@ -936,7 +1235,7 @@ class VolumeWindowDataloader(Dataset):
             - A tuple (windows, mask_windows) for sliding windows.
         """
         # Fetch patient ID and corresponding volume and mask
-        patient_id = self.patient_ids[index]
+        patient_id = self.patient_list_to_load[index]
         volume, mask = self.dataset.get_patient_volume(patient_id)
 
         # If no valid windows exist for the patient, skip them
