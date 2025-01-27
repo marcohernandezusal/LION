@@ -710,15 +710,17 @@ class LIDC_IDRI(Dataset):
             patient_index, slice_index
         )
 
-    def interpolate_volume(self, volume, original_spacing, target_spacing, method = 'bspline', order = 3, sinc_width = 5):
+    def interpolate_volume(
+        self, volume, original_spacing, target_spacing, method="bspline", order=3, sinc_width=5
+    ):
         """
         Resample a 3D volume to the target spacing using the specified interpolation method.
 
         Parameters:
-            - volume (np.ndarray): Input 3D volume (z, y, x).
+            - volume (np.ndarray or torch.Tensor): Input 3D volume (z, y, x).
             - original_spacing (tuple): Original voxel spacing (z, y, x).
             - target_spacing (tuple): Desired voxel spacing (z, y, x).
-            - method (str): Interpolation method. Options: 'bspline', 'welch_sinc'.
+            - method (str): Interpolation method. Options: 'bspline', 'welch_sinc', 'trilinear', 'nearest'.
             - order (int): B-Spline order. Relevant if method='bspline'. Default is 3 (cubic).
             - sinc_width (int): Number of sinc lobes on each side. Relevant if method='welch_sinc'. Default is 5.
 
@@ -731,33 +733,37 @@ class LIDC_IDRI(Dataset):
         assert len(target_spacing) == volume.ndim, (
             f"Target spacing {target_spacing} must match volume dimensions {volume.ndim}."
         )
-        assert method in ['bspline', 'welch_sinc'], (
-            f"Unsupported interpolation method '{method}'. Choose 'bspline' or 'welch_sinc'."
+        assert method in ['bspline', 'welch_sinc', 'trilinear', 'nearest'], (
+            f"Unsupported interpolation method '{method}'. Choose 'bspline', 'welch_sinc', 'trilinear', or 'nearest'."
         )
 
         resize_factors = [original / target for original, target in zip(original_spacing, target_spacing)]
-        logging.debug(f"Interpolation method: {method}")
-        logging.debug(f"Original spacing: {original_spacing}, Target spacing: {target_spacing}")
-        logging.debug(f"Resize factors: {resize_factors}")
+        if method == "bspline":
+            # B-Spline interpolation using scipy.ndimage.zoom
+            return zoom(volume, resize_factors, order=order)
 
-        if method == 'bspline':
-            logging.debug(f"Performing B-Spline interpolation with order={order}")
-            resampled = zoom(volume, resize_factors, order=order)
-            logging.debug(f"Resampled volume shape (B-Spline): {resampled.shape}")
-            return resampled
+        elif method == "trilinear":
+            # Trilinear interpolation using PyTorch
+            volume_tensor = torch.tensor(volume, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+            resized_tensor = torch.nn.functional.interpolate(
+                volume_tensor,
+                scale_factor=resize_factors[::-1],  # PyTorch expects (depth, height, width)
+                mode="trilinear",
+                align_corners=False,
+            )
+            return resized_tensor.squeeze().numpy()
 
-        elif method == 'welch_sinc':
-            logging.debug(f"Performing Welch windowed sinc interpolation with sinc_width={sinc_width}")
-            resampled = self.welch_windowed_sinc_interpolate(volume, resize_factors, sinc_width)
-            logging.debug(f"Resampled volume shape (Welch Sinc): {resampled.shape}")
-            return resampled
+        elif method == "nearest":
+            # Nearest-neighbor interpolation using scipy.ndimage.zoom
+            return zoom(volume, resize_factors, order=0)
+
+        elif method == "welch_sinc":
+            # Welch windowed sinc interpolation
+            return self.welch_windowed_sinc_interpolate(volume, resize_factors, sinc_width)
 
     def welch_windowed_sinc_interpolate(
-        self,
-        volume: np.ndarray,
-        resize_factors: list,
-        sinc_width: int = 5
-    ) -> np.ndarray:
+        self, volume, resize_factors, sinc_width=5
+    ):
         """
         Apply Welch windowed sinc interpolation to a 3D volume.
 
@@ -769,11 +775,9 @@ class LIDC_IDRI(Dataset):
         Returns:
             - Resampled 3D volume (np.ndarray).
         """
-        logging.debug("Starting Welch windowed sinc interpolation.")
-
         def resample_axis(data, axis, factor, sinc_width):
             """
-            Resample data along a single axis using windowed sinc interpolation.
+            Resample data along a single axis using Welch windowed sinc interpolation.
 
             Parameters:
                 - data (np.ndarray): Input data.
@@ -782,45 +786,27 @@ class LIDC_IDRI(Dataset):
                 - sinc_width (int): Number of sinc lobes on each side.
 
             Returns:
-                - Resampled data.
+                - Resampled data (np.ndarray).
             """
-            logging.debug(f"Resampling axis {axis} with factor {factor} and sinc_width {sinc_width}.")
-
             original_size = data.shape[axis]
             target_size = int(np.round(original_size * factor))
-            logging.debug(f"Original size: {original_size}, Target size: {target_size}")
+            x = np.arange(original_size)
+            target_x = np.linspace(0, original_size - 1, target_size)
 
-            # Create the output indices
-            target_indices = np.linspace(0, original_size, target_size, endpoint=False)
+            # Compute sinc kernel
+            sinc_kernel = np.sinc(x[:, None] - target_x[None, :])
+            welch_window = np.hanning(2 * sinc_width + 1)  # Welch window
+            welch_kernel = welch_window * sinc_kernel[:, sinc_width:-sinc_width]
 
-            # Define the sinc kernel
-            # Calculate the distance between original and target samples
-            x = (target_indices - np.arange(original_size)[:, np.newaxis])
-            x = x / factor  # Scale by resize factor
-            x = x[np.abs(x) <= sinc_width]  # Limit to sinc_width
-
-            # Apply sinc function
-            sinc_kernel = np.sinc(x)
-
-            # Apply Welch (Hanning) window
-            window = get_window('hanning', sinc_kernel.shape[1])
-            windowed_sinc = sinc_kernel * window
-            windowed_sinc /= np.sum(windowed_sinc, axis=1, keepdims=True)  # Normalize
-
-            # Perform convolution using the windowed sinc kernel
-            resampled = convolve1d(data, windowed_sinc, axis=axis, mode='mirror')
-
-            logging.debug(f"Completed resampling axis {axis}.")
+            # Convolve along the axis
+            resampled = convolve(data, welch_kernel, mode="mirror", method="direct")
             return resampled
 
         resampled_volume = volume.copy()
         for axis, factor in enumerate(resize_factors):
             if factor == 1.0:
-                logging.debug(f"No resampling needed for axis {axis}. Skipping.")
-                continue  # Skip axes with no resampling needed
+                continue
             resampled_volume = resample_axis(resampled_volume, axis, factor, sinc_width)
-
-        logging.debug("Completed Welch windowed sinc interpolation.")
         return resampled_volume
 
 
@@ -1195,14 +1181,14 @@ class LIDC_IDRI(Dataset):
 class VolumeWindowDataloader(Dataset):
     def __init__(self, dataset, window_depth, pad_value=0, stride=1, nodule_only=True):
         """
-        A dynamic dataloader for processing volumes as they are accessed.
+        A dynamic dataloader for processing volumes or patches as they are accessed.
 
         Parameters:
             - dataset (LIDC_IDRI): The dataset instance, which determines mode and patients.
             - window_depth (int): Fixed depth of each window.
-            - pad_value (float): Value to pad volumes smaller than the window depth.
+            - pad_value (float): Value to pad volumes/patches smaller than the window depth.
             - stride (int): The step size for the sliding window.
-            - nodule_only (bool): If True, only include slices with nodules.
+            - nodule_only (bool): If True, only include windows with nodules.
         """
         self.dataset = dataset
         self.window_depth = window_depth
@@ -1211,6 +1197,8 @@ class VolumeWindowDataloader(Dataset):
         self.nodule_only = nodule_only
 
         self.mode = dataset.params.mode
+        self.tumor_patch_mode = dataset.params.tumor_patch_mode
+
         if self.mode == "train":
             self.patient_ids = dataset.training_patients_list
         elif self.mode == "validation":
@@ -1226,81 +1214,138 @@ class VolumeWindowDataloader(Dataset):
 
     def __getitem__(self, index):
         """
-        Dynamically processes a single volume from the dataset and yields its sliding windows.
-        
+        Dynamically processes a single patient volume or patches from the dataset.
+
         Parameters:
             - index: Index of the patient in the dataset.
 
         Returns:
-            - A tuple (windows, mask_windows) for sliding windows.
+            - Sliding windows and masks for the patient's volume or patches.
         """
-        # Fetch patient ID and corresponding volume and mask
-        patient_id = self.patient_list_to_load[index]
-        volume, mask = self.dataset.get_patient_volume(patient_id)
+        # Fetch patient ID and data
+        patient_id = self.patient_ids[index]
+        data = self.dataset.get_patient_volume(patient_id)
 
-        # If no valid windows exist for the patient, skip them
-        if volume.shape[1] == 1 and mask.shape[1] == 2:
-            # print(f"Skipping patient {patient_id} as there are no valid windows with nodules.")
-            return None  # Skip empty windows
+        if self.tumor_patch_mode:
+            # Patch mode: Process each patch separately
+            return self._process_patches(data)
+        else:
+            # Volume mode: Process the full volume
+            return self._process_volume(data)
 
-        depth = volume.shape[1]
+    def _process_patches(self, patches):
+        """
+        Generates sliding windows for all patches.
 
-        # Pad the volume and mask if the depth is smaller than the window depth
+        Parameters:
+            - patches: List of (patch_volume, patch_mask) tuples.
+
+        Returns:
+            - Sliding windows and masks for all patches combined.
+        """
+        all_windows = []
+        all_mask_windows = []
+
+        for patch_volume, patch_mask in patches:
+            # Pad patches to ensure consistent depth
+            if patch_volume.shape[0] < self.window_depth:
+                pad_size = self.window_depth - patch_volume.shape[0]
+                patch_volume = torch.nn.functional.pad(
+                    patch_volume, (0, 0, 0, 0, pad_size, 0), value=self.pad_value
+                )
+                patch_mask = torch.nn.functional.pad(
+                    patch_mask, (0, 0, 0, 0, pad_size, 0), value=self.pad_value
+                )
+
+            windows, mask_windows = self._generate_windows(patch_volume, patch_mask)
+            if windows is not None:
+                all_windows.append(windows)
+                all_mask_windows.append(mask_windows)
+
+        if len(all_windows) == 0:
+            return None  # No valid windows found
+
+        # Concatenate all windows and mask_windows
+        all_windows = torch.cat(all_windows, dim=0)
+        all_mask_windows = torch.cat(all_mask_windows, dim=0)
+
+        return all_windows, all_mask_windows
+
+    def _process_volume(self, data):
+        """
+        Generates sliding windows for a full volume.
+
+        Parameters:
+            - data: A tuple (volume, mask) from the dataset.
+
+        Returns:
+            - Sliding windows and masks for the volume.
+        """
+        volume, mask = data
+        return self._generate_windows(volume, mask)
+
+    def _generate_windows(self, volume, mask):
+        """
+        Generates sliding windows for a single volume or patch.
+
+        Parameters:
+            - volume: Tensor of shape (depth, height, width).
+            - mask: Tensor of shape (depth, height, width).
+
+        Returns:
+            - windows: Tensor of shape (num_windows, window_depth, height, width).
+            - mask_windows: Tensor of shape (num_windows, window_depth, height, width).
+        """
+        depth = volume.shape[0]
+
+        # Pad the volume/mask depth if it's smaller than the window depth
         if depth < self.window_depth:
             pad_size = self.window_depth - depth
-            volume = torch.nn.functional.pad(volume, (0, 0, 0, 0, pad_size, 0), value=self.pad_value)
-            mask = torch.nn.functional.pad(mask, (0, 0, 0, 0, pad_size, 0), value=self.pad_value)
-            depth = self.window_depth  # Update depth after padding
+            volume = torch.nn.functional.pad(
+                volume, (0, 0, 0, 0, pad_size, 0), value=self.pad_value
+            )
+            mask = torch.nn.functional.pad(
+                mask, (0, 0, 0, 0, pad_size, 0), value=self.pad_value
+            )
+            depth = self.window_depth
 
-        # Create sliding windows
+        # Generate sliding windows
         windows = []
         mask_windows = []
         for start_idx in range(0, depth - self.window_depth + 1, self.stride):
             end_idx = start_idx + self.window_depth
-            if end_idx > depth:  # Safety check
-                break
-            window = volume[:, start_idx:end_idx, :, :]
-            mask_window = mask[:, start_idx:end_idx, :, :]
+            window = volume[start_idx:end_idx, :, :]
+            mask_window = mask[start_idx:end_idx, :, :]
 
-            if self.nodule_only:
-                # Check if the mask window contains any nodules
-                if mask_window[1].sum() == 0:  # No nodules found in this window
-                    continue  # Skip this window if no nodules
+            if self.nodule_only and mask_window.sum() == 0:
+                continue  # Skip windows without nodules
 
             windows.append(window)
             mask_windows.append(mask_window)
 
-        # If no valid windows, return None
-        if len(windows) == 0:
-            # print(f"Skipping patient {patient_id} as no valid windows were found with nodules.")
-            return None  # Skip empty windows
-
-        # Ensure the last window includes the final slices of the volume
-        if len(windows) == 0 or windows[-1].shape[1] < self.window_depth:
+        # Handle last window if necessary
+        if len(windows) == 0 or (depth - self.window_depth) % self.stride != 0:
             start_idx = max(0, depth - self.window_depth)
-            window = volume[:, start_idx:, :, :]
-            mask_window = mask[:, start_idx:, :, :]
+            window = volume[start_idx:, :, :]
+            mask_window = mask[start_idx:, :, :]
 
             # Pad the last window if needed
-            if window.shape[1] < self.window_depth:
-                pad_size = self.window_depth - window.shape[1]
+            if window.shape[0] < self.window_depth:
+                pad_size = self.window_depth - window.shape[0]
                 window = torch.nn.functional.pad(window, (0, 0, 0, 0, 0, pad_size), value=self.pad_value)
                 mask_window = torch.nn.functional.pad(mask_window, (0, 0, 0, 0, 0, pad_size), value=self.pad_value)
-            
-            if self.nodule_only:
-                # Check if the mask window contains any nodules
-                if mask_window[1].sum() != 0:  # Check if the nodule is present
-                    windows.append(window)
-                    mask_windows.append(mask_window)
+
+            if self.nodule_only and mask_window.sum() == 0:
+                pass  # Skip the last window if nodule-only filtering applies
             else:
                 windows.append(window)
                 mask_windows.append(mask_window)
 
-        # Stack windows into tensors
-        windows = torch.stack(windows)
-        mask_windows = torch.stack(mask_windows)
+        if len(windows) == 0:
+            return None  # No valid windows found
 
-        return windows, mask_windows
+        # Stack windows into tensors
+        return torch.stack(windows), torch.stack(mask_windows)
 
 
 
